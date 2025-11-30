@@ -1,0 +1,174 @@
+version: '3.8'
+
+services:
+  # MinIO - S3-compatible object storage
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    networks:
+      - data-engineering
+
+  # PostgreSQL - for Nessie catalog metadata
+  postgres:
+    image: postgres:15-alpine
+    container_name: nessie-postgres
+    environment:
+      POSTGRES_USER: nessie
+      POSTGRES_PASSWORD: nessie
+      POSTGRES_DB: nessie
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nessie"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - data-engineering
+
+  # Nessie Catalog Server - for Iceberg table catalog
+  nessie:
+    image: projectnessie/nessie:latest
+    container_name: nessie-catalog
+    ports:
+      - "19120:19120"
+    environment:
+      QUARKUS_HTTP_PORT: 19120
+      QUARKUS_HTTP_CORS_ORIGINS: "*"
+      QUARKUS_DATASOURCE_JDBC_URL: jdbc:postgresql://postgres:5432/nessie
+      QUARKUS_DATASOURCE_USERNAME: nessie
+      QUARKUS_DATASOURCE_PASSWORD: nessie
+      QUARKUS_HIBERNATE_ORM_DATABASE_GENERATION: update
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:19120/api/v2/config"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks:
+      - data-engineering
+
+  # Spark Connect Server
+  spark-connect:
+    image: apache/spark-py:3.5.0
+    container_name: spark-connect
+    ports:
+      - "15000:15000"
+      - "15001:15001"
+      - "15002:15002"
+    environment:
+      SPARK_MODE: connect
+      SPARK_CONNECT_GRPC_BINDING_PORT: 15000
+      SPARK_CONNECT_GRPC_BINDING_ADDRESS: 0.0.0.0
+      SPARK_CONNECT_GRPC_ARROW_MAX_BATCH_SIZE: 1024
+      SPARK_CONNECT_GRPC_MAX_INBOUND_MESSAGE_SIZE: 1073741824
+      SPARK_LOCAL_DIRS: /tmp/spark-local
+      SPARK_WORKER_DIR: /tmp/spark-worker
+      # Iceberg Configuration
+      SPARK_SQL_EXTENSIONS: org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions
+      SPARK_SQL_CATALOG_nessie: org.apache.iceberg.spark.SparkCatalog
+      SPARK_SQL_CATALOG_nessie_URI: http://nessie:19120/api/v1
+      SPARK_SQL_CATALOG_nessie_REF: main
+      SPARK_SQL_CATALOG_nessie_WAREHOUSE: s3a://warehouse/
+      SPARK_SQL_CATALOG_nessie_IO_IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      SPARK_SQL_CATALOG_nessie_S3_ENDPOINT: http://minio:9000
+      SPARK_SQL_CATALOG_nessie_S3_ACCESS_KEY_ID: minioadmin
+      SPARK_SQL_CATALOG_nessie_S3_SECRET_ACCESS_KEY: minioadmin
+      SPARK_SQL_CATALOG_nessie_S3_PATH_STYLE_ACCESS: "true"
+      # MinIO S3 Configuration
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_ENDPOINT: http://minio:9000
+      AWS_REGION: us-east-1
+    volumes:
+      - spark_data:/tmp/spark
+      - ./spark-jars:/opt/spark/jars/iceberg
+      - ./init-scripts:/opt/spark/init-scripts
+    command: >
+      /opt/spark/bin/spark-class org.apache.spark.deploy.connect.SparkConnectServer
+      --port 15000
+      --host 0.0.0.0
+    depends_on:
+      minio:
+        condition: service_healthy
+      nessie:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:15000"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks:
+      - data-engineering
+
+  # Spark History Server (optional)
+  spark-history:
+    image: apache/spark-py:3.5.0
+    container_name: spark-history
+    ports:
+      - "18080:18080"
+    environment:
+      SPARK_HISTORY_OPTS: >
+        -Dspark.history.fs.logDirectory=/tmp/spark-events
+        -Dspark.history.ui.port=18080
+    volumes:
+      - spark_history_data:/tmp/spark-events
+    command: >
+      /opt/spark/bin/spark-class org.apache.spark.deploy.history.HistoryServer
+    networks:
+      - data-engineering
+
+  # Jupyter Notebook - for interactive development
+  jupyter:
+    image: jupyter/pyspark-notebook:latest
+    container_name: jupyter-iceberg
+    ports:
+      - "8888:8888"
+    environment:
+      JUPYTER_ENABLE_LAB: "yes"
+      SPARK_CONNECT_HOST: spark-connect
+      SPARK_CONNECT_PORT: 15000
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_ENDPOINT: http://minio:9000
+      AWS_REGION: us-east-1
+    volumes:
+      - ./notebooks:/home/jovyan/work
+      - ./spark-jars:/opt/spark/jars/iceberg
+    depends_on:
+      - spark-connect
+    networks:
+      - data-engineering
+
+volumes:
+  minio_data:
+    driver: local
+  postgres_data:
+    driver: local
+  spark_data:
+    driver: local
+  spark_history_data:
+    driver: local
+
+networks:
+  data-engineering:
+    driver: bridge
+
